@@ -1,0 +1,42 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class PharmacyDispensingItem extends Model
+{
+    protected $table = 'pharmacy_dispensing_items';
+
+    /**
+     * DB column names vary (unit_price vs selling_price). Controller filters by schema; allow all.
+     */
+    protected $guarded = [];
+
+    protected $casts = [
+        'expiry_date'   => 'date',
+        'quantity'      => 'integer',
+        'selling_price' => 'decimal:2',
+        'unit_price'    => 'decimal:2',
+        'gst_rate'      => 'decimal:2',
+        'gst_amount'    => 'decimal:2',
+        'total'         => 'decimal:2',
+        'total_price'   => 'decimal:2',
+    ];
+
+    public function dispensing(): BelongsTo
+    {
+        return $this->belongsTo(PharmacyDispensing::class, 'dispensing_id');
+    }
+
+    public function item(): BelongsTo
+    {
+        return $this->belongsTo(PharmacyItem::class, 'item_id');
+    }
+
+    public function stock(): BelongsTo
+    {
+        return $this->belongsTo(PharmacyStock::class, 'stock_id');
+    }
+}
