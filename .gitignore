@@ -1,66 +1,8 @@
-# Dependencies
-node_modules/
-vendor/
+# ── This remote tracks only `backend/` (Laravel). Ignore everything else in the repo root. ──
+/*
+!/backend/
+!/backend/**
+!/README.md
+!/.gitignore
 
-# Environment files (contain secrets)
-.env
-.env.local
-.env.production.local
-backend/.env
-
-# Build outputs
-dist/
-build/
-web/dist/
-
-# IDE / local AI
-.idea/
-.vscode/
-.claude/
-*.swp
-*.swo
-.DS_Store
-
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-storage/logs/*.log
-
-# Laravel
-storage/*.key
-bootstrap/cache/*
-public/storage
-
-# Composer
-composer.phar
-
-# Flutter
-mobile/.dart_tool/
-mobile/.packages
-mobile/build/
-mobile/*.iml
-mobile/.flutter-plugins
-mobile/.flutter-plugins-dependencies
-
-# OS
-Thumbs.db
-*.DS_Store
-
-# Testing
-coverage/
-.phpunit.result.cache
-
-# Misc
-*.bak
-*.tmp
-*.temp
-Archive.zip
-backend.zip
-*.zip
-
-# Local PDF generator venv (scripts/generate_docs_pdf.py)
-scripts/.venv_docs/
-# Downloaded by scripts/generate_docs_pdf.py (DejaVu OFL)
-scripts/fonts/NotoSans-Regular.ttf
+# (Optional) If you add stray files at repo root later, they stay untracked thanks to `/*` above.

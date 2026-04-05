@@ -5,6 +5,8 @@
 /storage/*.key
 /storage/pail
 /vendor
+.DS_Store
+/storage/logs/*.log
 .env
 .env.backup
 .env.production
