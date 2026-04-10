@@ -530,6 +530,7 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::post('/orders/{orderId}/collect-sample', [LabController::class, 'collectSampleWeb'])->name('orders.collect-sample');
         Route::get('/orders/{orderId}/report', [LabController::class, 'viewOrderReport'])->name('orders.report');
         Route::get('/orders/{orderId}/download', [LabController::class, 'downloadReport'])->name('orders.download');
+        Route::post('/orders/{orderId}/share-whatsapp', [LabController::class, 'shareOnWhatsApp'])->name('orders.share-whatsapp');
         Route::post('/orders/{orderId}/approve', [LabController::class, 'approveReport'])->name('orders.approve');
         Route::get('/orders/{orderId}/results', [LabController::class, 'resultEntry'])->name('result-entry');
         Route::post('/orders/{orderId}/results', [LabController::class, 'saveResult'])->name('save-result');
@@ -703,5 +704,9 @@ Route::post('/webhooks/razorpay', [PaymentWebController::class, 'handleWebhook']
 Route::get('/prescription/{prescription}/pdf-public', [PrescriptionWebController::class, 'generatePdf'])
     ->middleware('signed')
     ->name('prescription.pdf.public');
+
+Route::get('/laboratory/orders/{orderId}/pdf-public', [LabController::class, 'downloadReport'])
+    ->middleware('signed')
+    ->name('laboratory.orders.pdf.public');
 
 Route::post('/subscription/webhook', [SubscriptionController::class, 'webhook'])->name('subscription.webhook');

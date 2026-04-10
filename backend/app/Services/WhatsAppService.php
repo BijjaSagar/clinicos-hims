@@ -136,10 +136,10 @@ class WhatsAppService
     /**
      * Plain text first; if Meta rejects (outside 24h session), retry with utility template when configured.
      */
-    public function sendSessionTextWithFallback(string $phone, string $message, string $context = 'session'): array
+    public function sendSessionTextWithFallback(string $phone, string $message, ?string $templateFallback = null, ?array $templateComponents = null): array
     {
         Log::info('WhatsAppService::sendSessionTextWithFallback', [
-            'context' => $context,
+            'template' => $templateFallback,
             'len' => strlen($message),
         ]);
 
@@ -151,45 +151,43 @@ class WhatsAppService
             ]);
         }
 
-        $tpl = $this->resolveUtilityTextTemplateName();
-        if ($tpl === null) {
-            Log::warning('WhatsAppService::sendSessionTextWithFallback: text failed, no utility template configured', [
-                'context' => $context,
-                'code' => $response['code'] ?? null,
-                'error' => $response['error'] ?? null,
-            ]);
-
-            return array_merge($response, ['transport' => 'none']);
-        }
-
+        // Check if we should retry with a template
         if (! $this->shouldRetryTextWithTemplate($response)) {
             Log::info('WhatsAppService::sendSessionTextWithFallback: not using template retry', [
-                'context' => $context,
                 'code' => $response['code'] ?? null,
             ]);
 
             return array_merge($response, ['transport' => 'none']);
         }
 
-        $param = mb_substr($message, 0, 1020);
-        $lang = $this->resolveUtilityTextTemplateLanguage();
-        $retry = $this->sendTemplate($phone, $tpl, [$param], $lang);
-
-        Log::info('WhatsAppService::sendSessionTextWithFallback: template retry result', [
-            'context' => $context,
-            'template' => $tpl,
-            'success' => ! empty($retry['success']),
-        ]);
-
-        if (! empty($retry['success'])) {
-            return array_merge($retry, [
-                'transport' => 'template',
-                'utility_template' => $tpl,
-                'success' => true,
-            ]);
+        // Use specific fallback template if provided, else use the generic utility template
+        $tpl = $templateFallback ?: $this->resolveUtilityTextTemplateName();
+        if ($tpl === null) {
+            Log::warning('WhatsAppService::sendSessionTextWithFallback: text failed, no utility template configured');
+            return array_merge($response, ['transport' => 'none']);
         }
 
-        return array_merge($retry, ['transport' => 'template_failed', 'utility_template' => $tpl]);
+        // Resolve components: use provided ones OR the message itself if using generic template
+        $components = $templateComponents;
+        if ($components === null) {
+            $components = [mb_substr($message, 0, 1020)];
+        }
+
+        $lang = $this->resolveUtilityTextTemplateLanguage();
+        $retry = $this->sendTemplate($phone, $tpl, $components, $lang);
+
+        Log::info('WhatsAppService::sendSessionTextWithFallback retry', [
+            'success' => ! empty($retry['success']),
+            'template' => $tpl,
+            'retry_code' => $retry['code'] ?? null,
+            'retry_error' => $retry['error'] ?? null,
+        ]);
+
+        return array_merge($retry, [
+            'transport' => 'template',
+            'utility_template' => $tpl,
+            'success' => ! empty($retry['success']),
+        ]);
     }
 
     private function shouldRetryTextWithTemplate(array $response): bool
@@ -313,6 +311,79 @@ class WhatsAppService
     }
 
     /**
+     * Send interactive buttons (up to 3 buttons allowed by Meta).
+     *
+     * @param string $phone E.164 number
+     * @param string $bodyText The main message body text
+     * @param array $buttons Array of button definitions: [['id' => 'btn1', 'title' => 'Say Hi']]
+     */
+    public function sendInteractiveButtons(string $phone, string $bodyText, array $buttons): array
+    {
+        $phone = $this->formatPhone($phone);
+
+        $formattedButtons = [];
+        foreach (array_slice($buttons, 0, 3) as $btn) {
+            $formattedButtons[] = [
+                'type' => 'reply',
+                'reply' => [
+                    'id' => substr($btn['id'], 0, 256),
+                    'title' => substr($btn['title'], 0, 20), // Meta restricts title to 20 chars
+                ]
+            ];
+        }
+
+        return $this->callApi("/{$this->phoneNumberId}/messages", [
+            'messaging_product' => 'whatsapp',
+            'to'   => $phone,
+            'type' => 'interactive',
+            'interactive' => [
+                'type' => 'button',
+                'body' => [
+                    'text' => $bodyText
+                ],
+                'action' => [
+                    'buttons' => $formattedButtons
+                ]
+            ]
+        ]);
+    }
+
+    /**
+     * Send interactive list (up to 10 rows per section).
+     */
+    public function sendInteractiveList(string $phone, string $bodyText, string $buttonLabel, array $rows): array
+    {
+        $phone = $this->formatPhone($phone);
+        $sectionRows = [];
+        foreach (array_slice($rows, 0, 10) as $row) {
+            $sectionRows[] = [
+                'id'          => substr($row['id'], 0, 200),
+                'title'       => substr($row['title'], 0, 24),
+                'description' => isset($row['description']) ? substr($row['description'], 0, 72) : null,
+            ];
+        }
+
+        return $this->callApi("/{$this->phoneNumberId}/messages", [
+            'messaging_product' => 'whatsapp',
+            'to'   => $phone,
+            'type' => 'interactive',
+            'interactive' => [
+                'type' => 'list',
+                'body' => ['text' => $bodyText],
+                'action' => [
+                    'button' => substr($buttonLabel, 0, 20),
+                    'sections' => [
+                        [
+                            'title' => 'Options',
+                            'rows'  => $sectionRows,
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+    }
+
+    /**
      * Send a Razorpay / UPI payment link.
      */
     public function sendPaymentLink(
@@ -340,25 +411,36 @@ class WhatsAppService
     public function sendAppointmentConfirmation(Patient $patient, Appointment $appointment): array
     {
         $phone = $this->formatPhone($patient->phone);
-        $date  = Carbon::parse($appointment->scheduled_at)->format('d M Y, h:i A');
+        $date  = \Carbon\Carbon::parse($appointment->scheduled_at)->format('d M Y, h:i A');
         $doctor = $appointment->doctor->name ?? 'your doctor';
+        $clinicName = $appointment->clinic->name ?? 'ClinicOS';
 
-        $response = $this->sendTemplate($phone, 'appointment_confirmation', [
-            $patient->name,
-            $date,
-            $doctor,
-        ]);
+        // Message to send
+        $msg = "✅ *Appointment Confirmed*\n\nHi {$patient->name},\n\nYour appointment at *{$clinicName}* is confirmed for *{$date}* with Dr. {$doctor}.\n\nThank you!";
 
-        $this->logOutbound(
+        // Add teleconsult link if applicable
+        if ($appointment->appointment_type === 'teleconsultation' && $appointment->teleconsult_meeting_url) {
+            $msg .= "\n\n🎥 *Video Consultation Link:*\n{$appointment->teleconsult_meeting_url}\n\nPlease join the meeting at the scheduled time.";
+        }
+
+        // Send using session text (which works perfectly since the user likely just interacted via chatbot)
+        // It will automatically fall back if needed xbased on our unified helper.
+        $response = $this->sendSessionTextWithFallback($patient->phone, $msg, 'appointment_confirmation');
+
+        $tpl = $response['utility_template'] ?? 'appointment_confirmation';
+        $mType = (($response['transport'] ?? '') === 'template') ? 'template' : 'text';
+
+        // Persist internally
+        $this->persistPlainText(
             $appointment->clinic_id,
             $patient->id,
             'appointment_confirmation',
-            'template',
-            "Appointment confirmed — {$date}",
-            'appointment_confirmation',
-            $response,
+            $msg,
             $phone,
+            $response,
             $appointment->id,
+            $tpl,
+            $mType
         );
 
         return $response;
@@ -464,13 +546,14 @@ class WhatsAppService
     public function sendPrescription(Patient $patient, Prescription $prescription, string $pdfUrl): array
     {
         $phone = $this->formatPhone($patient->phone);
-        $date  = $prescription->created_at?->format('d M Y') ?? now()->format('d M Y');
+        $dateStr = $prescription->created_at ? $prescription->created_at->format('Y-m-d') : now()->format('Y-m-d');
+        $filename = "prescription_{$dateStr}.pdf";
 
         $response = $this->sendDocument(
             $phone,
             $pdfUrl,
-            "prescription_{$date}.pdf",
-            "Your prescription from {$date}. Please take medicines as prescribed."
+            $filename,
+            "Your prescription " . ($prescription->created_at ? "dated " . $prescription->created_at->format('d M Y') : "") . ". Please take medicines as prescribed."
         );
 
         $this->logOutbound(
@@ -478,7 +561,7 @@ class WhatsAppService
             $patient->id,
             'prescription',
             'document',
-            "Prescription PDF — {$date}",
+            "Prescription PDF — {$dateStr}",
             'prescription_document',
             $response,
             $phone,
@@ -494,23 +577,109 @@ class WhatsAppService
     public function sendLabResults(Patient $patient, LabOrder $labOrder): array
     {
         $phone = $this->formatPhone($patient->phone);
+        $clinicName = $labOrder->clinic->name ?? 'ClinicOS';
+        $testNames = $labOrder->display_test_names;
 
-        $response = $this->sendTemplate($phone, 'lab_results_ready', [
+        Log::info('WhatsAppService::sendLabResults internal start', [
+            'order_id' => $labOrder->id,
+            'patient_id' => $patient->id,
+            'phone' => $phone,
+            'test_names' => $testNames,
+        ]);
+
+        // Session Text Message
+        $msg = "🔬 *Lab Results Ready*\n\nHi {$patient->name},\n\nYour results for *{$testNames}* at *{$clinicName}* are now available.\n\nYou can view them in the portal or collect the physical copy at the reception.\n\nThank you for choosing us!";
+
+        // Send with fallback logic
+        $response = $this->sendSessionTextWithFallback($patient->phone, $msg, 'lab_results_ready', [
             $patient->name,
-            $labOrder->test_name ?? 'Lab Test',
+            $testNames,
             now()->format('d M Y'),
         ]);
+
+        Log::info('WhatsAppService::sendLabResults outcomes', [
+            'success' => !empty($response['success']),
+        ]);
+
+        return $response;
+    }
+
+    /**
+     * Notify patient upon registration. (Welcome message)
+     */
+    public function notifyPatientRegistered(Patient $patient): array
+    {
+        $phone = $this->formatPhone($patient->phone);
+        $clinicName = $patient->clinic->name ?? 'ClinicOS';
+        
+        $msg = "Welcome to *{$clinicName}*!\n\nHi {$patient->name},\n\nYou have been successfully registered with us.\n\nUHID: *{$patient->uhid}*\nPhone: *{$patient->phone}*\n\nWe look forward to providing you with the best care!\n\nThank you.";
+
+        $response = $this->sendSessionTextWithFallback($patient->phone, $msg, 'patient_welcome', [
+            $patient->name,
+            $clinicName,
+            $patient->uhid ?? 'New',
+        ]);
+
+        $this->logOutbound(
+            $patient->clinic_id,
+            $patient->id,
+            'welcome',
+            'text',
+            $msg,
+            null,
+            $response,
+            $phone
+        );
+
+        return $response;
+    }
+
+    /**
+     * Share lab report PDF via WhatsApp.
+     */
+    public function sendLabReportShare(Patient $patient, \App\Models\LabOrder $labOrder, string $pdfUrl): array
+    {
+        $phone = $this->formatPhone($patient->phone);
+        $testNames = $labOrder->display_test_names;
+        $dateStr = now('Asia/Kolkata')->format('d M Y');
+        $filename = "lab_report_{$labOrder->id}.pdf";
+
+        $caption = "Hi {$patient->name},\n\nYour lab results for *{$testNames}* are ready. Please find the attached report.\n\nDate: {$dateStr}";
+
+        $response = $this->sendDocument($phone, $pdfUrl, $filename, $caption);
 
         $this->logOutbound(
             $labOrder->clinic_id,
             $patient->id,
-            'result',
-            'template',
-            'Lab results ready',
-            'lab_results_ready',
+            'lab_report',
+            'document',
+            "Lab Report Share — {$testNames}",
+            null,
             $response,
             $phone,
+            $labOrder->id
+        );
+
+        return $response;
+    }
+            'transport' => $response['transport'] ?? 'none',
+            'success' => $response['success'] ?? false,
+            'error' => $response['error'] ?? null,
+        ]);
+
+        $tpl = $response['utility_template'] ?? 'lab_results_ready';
+        $mType = (($response['transport'] ?? '') === 'template') ? 'template' : 'text';
+
+        $this->persistPlainText(
+            $labOrder->clinic_id,
+            $patient->id,
+            'result',
+            $msg,
+            $phone,
+            $response,
             $labOrder->id,
+            $tpl,
+            $mType
         );
 
         return $response;
@@ -709,6 +878,9 @@ class WhatsAppService
 
         $safeFile = 'invoice-'.preg_replace('/[^A-Za-z0-9_.-]/', '_', (string) $num).'.pdf';
         $caption = "Invoice {$num} — ₹{$total} — ".($clinic->name ?? 'Clinic');
+        if (!empty($invoice->payment_link)) {
+            $caption .= "\n\nPay Online: {$invoice->payment_link}";
+        }
 
         $docResponse = $this->sendDocument($patient->phone, $signedPdfUrl, $safeFile, $caption);
 
@@ -763,6 +935,65 @@ class WhatsAppService
             'invoice_id' => $invoice->id,
             'success' => $response['success'] ?? null,
         ]);
+    }
+
+    /**
+     * Invoice paid — send updated PAID PDF receipt.
+     */
+    public function notifyInvoicePaid(Invoice $invoice): void
+    {
+        $invoice->loadMissing(['patient', 'clinic']);
+        $patient = $invoice->patient;
+        if (! $patient || $patient->phone === null || trim((string) $patient->phone) === '') {
+            return;
+        }
+
+        $clinic = $invoice->clinic;
+        $num = $invoice->invoice_number ?? ('INV-'.$invoice->id);
+        $total = number_format((float) ($invoice->total ?? 0), 2);
+        $phone = $this->formatPhone($patient->phone);
+
+        $signedPdfUrl = URL::temporarySignedRoute(
+            'billing.pdf.public',
+            now()->addDays(7),
+            ['invoice' => $invoice->id]
+        );
+
+        $safeFile = 'receipt-'.preg_replace('/[^A-Za-z0-9_.-]/', '_', (string) $num).'.pdf';
+        $caption = "Payment Received ✅\nInvoice {$num} — ₹{$total}\nThank you! — ".($clinic->name ?? 'Clinic');
+
+        $docResponse = $this->sendDocument($patient->phone, $signedPdfUrl, $safeFile, $caption);
+
+        $this->logOutbound(
+            $invoice->clinic_id,
+            $patient->id,
+            'manual',
+            'document',
+            'Paid Receipt PDF: '.$caption,
+            null,
+            $docResponse,
+            $phone,
+            $invoice->id,
+        );
+
+        if (! empty($docResponse['success'])) {
+            return;
+        }
+
+        $msg = "Hi {$patient->name},\n\nWe have received your payment of *₹{$total}* for Invoice *{$num}*.\n\nDownload Receipt: {$signedPdfUrl}\n\nThank you! — ".($clinic->name ?? 'Clinic');
+
+        $response = $this->sendSessionTextWithFallback($patient->phone, $msg, 'invoice_paid');
+        $this->persistPlainText(
+            $invoice->clinic_id,
+            $patient->id,
+            'manual',
+            $msg,
+            $phone,
+            $response,
+            $invoice->id,
+            $response['utility_template'] ?? null,
+            (($response['transport'] ?? '') === 'template') ? 'template' : 'text',
+        );
     }
 
     /**
@@ -991,20 +1222,53 @@ class WhatsAppService
     }
 
     /**
-     * Normalise phone to E.164 with +91 for Indian mobiles.
+     * Normalise phone to E.164 without the '+' for WhatsApp Cloud API.
+     * Special handling for Indian numbers (10 digits, or 11 starting with 0).
      */
-    private function formatPhone(string $phone): string
+    public function formatPhone(string $phone): string
     {
+        if (empty($phone)) return '';
+
+        // 1. Remove all non-digits
         $digits = preg_replace('/\D/', '', $phone);
 
+        // 2. Handle Indian numbers starting with 0 (e.g. 09876543210 -> 9876543210)
+        if (strlen($digits) === 11 && str_starts_with($digits, '0')) {
+            $digits = substr($digits, 1);
+        }
+
+        // 3. Handle '910...' cases where prefix 91 is followed by a redundant 0
+        if (strlen($digits) === 13 && str_starts_with($digits, '910')) {
+            $digits = '91' . substr($digits, 3);
+        }
+
+        // 4. If it is 10 digits, it is likely an Indian number without country code
         if (strlen($digits) === 10) {
             return '91' . $digits;
         }
 
-        if (strlen($digits) === 12 && str_starts_with($digits, '91')) {
-            return $digits;
-        }
+        // 5. Return as is if it already has country code
+        // Meta API prefers no leading '+'
+        return $digits;
+    }
 
-        return ltrim($digits, '+');
+    /**
+     * Send location (GPS pin).
+     */
+    public function sendLocation(string $phone, float $lat, float $lng, string $name, string $address): array
+    {
+        $phone = $this->formatPhone($phone);
+
+        return $this->callApi("/{$this->phoneNumberId}/messages", [
+            'messaging_product' => 'whatsapp',
+            'to'   => $phone,
+            'type' => 'location',
+            'location' => [
+                'longitude' => $lng,
+                'latitude'  => $lat,
+                'name'      => $name,
+                'address'   => $address,
+            ],
+        ]);
     }
 }

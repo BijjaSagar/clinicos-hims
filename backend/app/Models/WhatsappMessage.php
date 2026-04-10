@@ -62,6 +62,7 @@ class WhatsappMessage extends Model
     const TRIGGER_BIRTHDAY = 'birthday';
     const TRIGGER_MANUAL = 'manual';
     const TRIGGER_INBOUND_REPLY = 'inbound_reply';
+    const TRIGGER_PILL_REMINDER = 'pill_reminder';
 
     protected static function booted(): void
     {
@@ -204,7 +205,7 @@ class WhatsappMessage extends Model
             'error_code' => $errorCode,
             'error_message' => $errorMessage,
         ]);
-        
+
         Log::error('WhatsApp message failed', [
             'id' => $this->id,
             'error_code' => $errorCode,

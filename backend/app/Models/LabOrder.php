@@ -27,6 +27,12 @@ class LabOrder extends Model
         'fhir_resource_id',
         'total_amount',
         'clinical_notes',
+        'department_id',
+        'pathologist_id',
+        'accession_number',
+        'sample_collection_type',
+        'collection_date',
+        'collection_address',
     ];
 
     protected $casts = [
@@ -37,6 +43,40 @@ class LabOrder extends Model
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];
+
+    /**
+     * Convenience attributes for UI (mapped to Patient/Doctor relationships).
+     * These ensure automatic decryption of PII via Eloquent casts.
+     */
+    public function getPatientNameAttribute()
+    {
+        return $this->patient?->name;
+    }
+
+    public function getDoctorNameAttribute()
+    {
+        return $this->doctor?->name;
+    }
+
+    public function getGenderAttribute()
+    {
+        return $this->patient?->sex;
+    }
+
+    public function getDateOfBirthAttribute()
+    {
+        return $this->patient?->dob;
+    }
+
+    public function getPatientPhoneAttribute()
+    {
+        return $this->patient?->phone;
+    }
+
+    public function getPhoneAttribute()
+    {
+        return $this->patient?->phone;
+    }
 
     const STATUS_NEW = 'new';
     const STATUS_ACCEPTED = 'accepted';
@@ -88,7 +128,17 @@ class LabOrder extends Model
 
     public function doctor(): BelongsTo
     {
-        return $this->belongsTo(User::class, 'doctor_id');
+        // Try doctor_id first, then fallback to ordered_by or created_by
+        $cols = \Illuminate\Support\Facades\Schema::getColumnListing('lab_orders');
+        $fk = 'doctor_id';
+        if (!in_array('doctor_id', $cols)) {
+            if (in_array('ordered_by', $cols)) {
+                $fk = 'ordered_by';
+            } elseif (in_array('created_by', $cols)) {
+                $fk = 'created_by';
+            }
+        }
+        return $this->belongsTo(User::class, $fk);
     }
 
     public function visit(): BelongsTo
@@ -101,6 +151,21 @@ class LabOrder extends Model
         return $this->belongsTo(VendorLab::class, 'vendor_id');
     }
 
+    public function department(): BelongsTo
+    {
+        return $this->belongsTo(LabDepartment::class, 'department_id');
+    }
+
+    public function orderedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'doctor_id');
+    }
+
+    public function pathologist(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'pathologist_id');
+    }
+
     /**
      * Line items in lab_order_tests table.
      * Named labOrderTests — NOT "tests" — because lab_orders.tests is also a JSON column (integration orders).
@@ -111,16 +176,48 @@ class LabOrder extends Model
     }
 
     /**
+     * Line items in lab_order_items table (HIMS Lab management).
+     */
+    public function labOrderItems(): HasMany
+    {
+        // Try to resolve the foreign key (lab_order_id vs order_id)
+        $fk = \Illuminate\Support\Facades\Schema::hasColumn('lab_order_items', 'lab_order_id') ? 'lab_order_id' : 'order_id';
+        return $this->hasMany(\App\Models\LabOrderItem::class, $fk);
+    }
+
+    /**
      * Human-readable test list for EMR/UI (JSON integration payload or lab_order_tests rows).
      */
     public function getDisplayTestNamesAttribute(): string
     {
         try {
+            // Priority 1: lab_order_items (HIMS Lab)
+            $items = \Illuminate\Support\Facades\DB::table('lab_order_items')
+                ->join('lab_tests_catalog', function($join) {
+                    $itemCols = \Illuminate\Support\Facades\Schema::getColumnListing('lab_order_items');
+                    $testFk = in_array('test_id', $itemCols) ? 'test_id' : 'lab_test_catalog_id';
+                    $join->on("lab_order_items.{$testFk}", '=', 'lab_tests_catalog.id');
+                })
+                ->where(function($q) {
+                    $itemCols = \Illuminate\Support\Facades\Schema::getColumnListing('lab_order_items');
+                    $orderFk = in_array('lab_order_id', $itemCols) ? 'lab_order_id' : 'order_id';
+                    $q->where("lab_order_items.{$orderFk}", $this->id);
+                })
+                ->pluck('lab_tests_catalog.test_name')
+                ->filter()
+                ->unique();
+
+            if ($items->isNotEmpty()) {
+                return $items->join(', ');
+            }
+
+            // Priority 2: lab_order_tests (Legacy EMR)
             if ($this->relationLoaded('labOrderTests') && $this->labOrderTests->isNotEmpty()) {
                 $s = $this->labOrderTests->pluck('test_name')->filter()->join(', ');
-
                 return $s !== '' ? $s : 'Lab Tests';
             }
+
+            // Priority 3: JSON data
             $raw = $this->attributes['tests'] ?? null;
             if ($raw !== null && $raw !== '') {
                 $d = is_string($raw) ? json_decode($raw, true) : $raw;
@@ -141,6 +238,31 @@ class LabOrder extends Model
         }
 
         return 'Lab Tests';
+    }
+
+
+    public function getTestsCountAttribute(): int
+    {
+        try {
+            // Count from lab_order_items (HIMS)
+            $itemsCount = $this->labOrderItems()->count();
+            if ($itemsCount > 0) {
+                return $itemsCount;
+            }
+
+            // Fallback: Check JSON data
+            $raw = $this->attributes['tests'] ?? null;
+            if ($raw !== null && $raw !== '') {
+                $d = is_string($raw) ? json_decode($raw, true) : $raw;
+                if (is_array($d)) {
+                    return count($d);
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('LabOrder::tests_count failed', ['id' => $this->id, 'error' => $e->getMessage()]);
+        }
+
+        return 0;
     }
 
     public function scopeForClinic($query, int $clinicId)

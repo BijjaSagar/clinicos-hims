@@ -278,6 +278,11 @@ $guideTips = [
                        class="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-surface-container transition-all" title="Download Report (PDF)">
                         <span class="material-symbols-outlined text-sm" style="color:#059669;">download</span>
                     </a>
+
+                    <button type="button" @click.prevent="shareOnWhatsApp({{ $order->id }})"
+                       class="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-[#25D366]/10 transition-all" title="Share on WhatsApp">
+                        <span class="material-symbols-outlined text-sm text-[#25D366]">share</span>
+                    </button>
                     @endif
 
                     <button type="button" @click.prevent="previewOrderDetails({{ $order->id }})"
@@ -816,6 +821,28 @@ window.labDashboard = function labDashboard(cfg) {
                 else { window.clinicToast('Could not load order details', 'error'); this.showPreviewPanel = false; }
             } catch (e) { window.clinicToast('Network error loading details', 'error'); this.showPreviewPanel = false; }
             finally { this.previewLoading = false; }
+        },
+
+        async shareOnWhatsApp(id) {
+            try {
+                window.clinicToast('Sending report to patient via WhatsApp...', 'info');
+                const response = await fetch(`/laboratory/orders/${id}/share-whatsapp`, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json', 
+                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content, 
+                        'Accept': 'application/json' 
+                    }
+                });
+                const data = await response.json();
+                if (data.success) {
+                    window.clinicToast('Report shared successfully!', 'success');
+                } else {
+                    window.clinicToast(data.error || 'Failed to share report', 'error');
+                }
+            } catch (e) {
+                window.clinicToast('Network error while sharing', 'error');
+            }
         },
 
         async submitQuickCollection() {

@@ -12,11 +12,13 @@ use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use App\Jobs\InitiateAbhaCreation;
 
 class PatientController extends Controller
 {
     public function __construct(
         private readonly S3Service $s3,
+        private readonly \App\Services\WhatsAppService $whatsApp,
     ) {}
 
     // -------------------------------------------------------------------------
@@ -35,15 +37,9 @@ class PatientController extends Controller
         $query = Patient::where('clinic_id', $clinicId)
             ->whereNull('deleted_at');
 
-        // Full-text style search across name, phone, abha_id
+        // Secure Blind Index Search across name, phone, email, abha_id
         if ($request->filled('search')) {
-            $term = $request->input('search');
-            $query->where(function ($q) use ($term) {
-                $q->where('name', 'like', "%{$term}%")
-                  ->orWhere('phone', 'like', "%{$term}%")
-                  ->orWhere('abha_id', 'like', "%{$term}%")
-                  ->orWhere('email', 'like', "%{$term}%");
-            });
+            $query->searchByToken($request->input('search'));
         }
 
         if ($request->filled('doctor_id')) {
@@ -133,21 +129,31 @@ class PatientController extends Controller
         $validated = $request->validated();
 
         $patient = DB::transaction(function () use ($validated, $clinicId) {
+            // Reconstruct full name for legacy fields and search indexing
+            $fullName = trim(($validated['salutation'] ?? '') . ' ' . 
+                             $validated['first_name'] . ' ' . 
+                             ($validated['middle_name'] ?? '') . ' ' . 
+                             ($validated['last_name'] ?? ''));
+
             $patient = Patient::create([
                 'clinic_id'          => $clinicId,
-                'name'               => $validated['name'],
-                'phone'              => $validated['phone'],
-                'dob'                => $validated['dob'],
-                'gender'             => $validated['gender'],
+                'salutation'         => $validated['salutation'] ?? null,
+                'first_name'         => $validated['first_name'],
+                'middle_name'        => $validated['middle_name'] ?? null,
+                'last_name'          => $validated['last_name'] ?? null,
+                'name'               => $fullName, // sync legacy field
+                'mlc_id'             => $validated['mlc_id'] ?? null,
+                'mlc_type'           => $validated['mlc_type'] ?? null,
+                'phone'              => $this->whatsApp->formatPhone($validated['phone']),
+                'dob'                => $validated['dob'] ?? null,
+                'age_years'          => $validated['age_years'] ?? null,
+                'sex'                => $validated['sex'] ?? null,
                 'blood_group'        => $validated['blood_group'] ?? null,
                 'email'              => $validated['email'] ?? null,
-                'address_line1'      => $validated['address_line1'] ?? null,
-                'address_line2'      => $validated['address_line2'] ?? null,
-                'city'               => $validated['city'] ?? null,
-                'state'              => $validated['state'] ?? null,
-                'pincode'            => $validated['pincode'] ?? null,
-                'allergies'          => $validated['allergies'] ?? [],
-                'family_history'     => $validated['family_history'] ?? null,
+                'address'            => $validated['address'] ?? null,
+                'known_allergies'    => $validated['known_allergies'] ?? null,
+                'chronic_conditions' => $validated['chronic_conditions'] ?? null,
+                'current_medications'=> $validated['current_medications'] ?? null,
                 'registered_by'      => auth()->id(),
                 'status'             => 'active',
             ]);
@@ -163,6 +169,15 @@ class PatientController extends Controller
 
             return $patient;
         });
+
+        // Send Welcome Message via WhatsApp
+        if ($patient->phone) {
+            try {
+                $this->whatsApp->notifyPatientRegistered($patient);
+            } catch (\Throwable $e) {
+                Log::warning('Failed to send registration welcome message', ['error' => $e->getMessage()]);
+            }
+        }
 
         // Initiate ABHA creation asynchronously if requested
         $abhaInitiated = false;
@@ -215,6 +230,9 @@ class PatientController extends Controller
         ]);
 
         DB::transaction(function () use ($patient, $validated) {
+            if (isset($validated['phone'])) {
+                $validated['phone'] = $this->whatsApp->formatPhone($validated['phone']);
+            }
             $patient->fill($validated)->save();
 
             if (isset($validated['emergency_contact_name'])) {

@@ -783,15 +783,20 @@ class LabController extends Controller
 
     public function downloadReport(Request $request, $orderId)
     {
-        $clinicId = auth()->user()->clinic_id;
         try {
-            $order = \App\Models\LabOrder::with(['patient', 'doctor', 'clinic'])
-                ->where('id', $orderId)
-                ->where('clinic_id', $clinicId)
-                ->firstOrFail();
+            if ($request->hasValidSignature()) {
+                 $order = \App\Models\LabOrder::with(['patient', 'doctor', 'clinic'])->findOrFail($orderId);
+                 $clinic = $order->clinic;
+            } else {
+                 $clinicId = auth()->user()->clinic_id;
+                 $order = \App\Models\LabOrder::with(['patient', 'doctor', 'clinic'])
+                    ->where('id', $orderId)
+                    ->where('clinic_id', $clinicId)
+                    ->firstOrFail();
+                 $clinic = auth()->user()->clinic;
+            }
             
             $items = $this->buildResultEntryLineItems($orderId);
-            $clinic = auth()->user()->clinic;
 
             $pdf = Pdf::loadView('lab.report-pdf', compact('order', 'items', 'clinic'));
             
@@ -799,6 +804,30 @@ class LabController extends Controller
         } catch (\Throwable $e) {
             Log::error('LabController@downloadReport error', ['error' => $e->getMessage(), 'order_id' => $orderId]);
             return redirect()->back()->with('error', 'Failed to generate PDF: ' . $e->getMessage());
+        }
+    }
+
+    public function shareOnWhatsApp(Request $request, $orderId)
+    {
+        $clinicId = auth()->user()->clinic_id;
+        try {
+            $order = \App\Models\LabOrder::with(['patient'])->where('id', $orderId)->where('clinic_id', $clinicId)->firstOrFail();
+            $patient = $order->patient;
+
+            if (!$patient || !$patient->phone) {
+                return response()->json(['success' => false, 'error' => 'Patient has no WhatsApp number']);
+            }
+
+            $success = app(\App\Services\WhatsAppService::class)->sendLabReportShare($patient, $order);
+
+            if ($success) {
+                return response()->json(['success' => true]);
+            } else {
+                return response()->json(['success' => false, 'error' => 'Failed to send message via WhatsApp']);
+            }
+        } catch (\Throwable $e) {
+            Log::error('LabController@shareOnWhatsApp error', ['error' => $e->getMessage()]);
+            return response()->json(['success' => false, 'error' => $e->getMessage()]);
         }
     }
 

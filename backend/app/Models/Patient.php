@@ -19,6 +19,7 @@ class Patient extends Model
 
     protected $fillable = [
         'clinic_id',
+        'uhid',
         'name',
         'dob',
         'age_years',
@@ -28,10 +29,17 @@ class Patient extends Model
         'phone_alt',
         'email',
         'address',
+        'aadhaar',
         'abha_id',
         'abha_address',
         'abha_verified',
         'abdm_consent_active',
+        'salutation',
+        'first_name',
+        'middle_name',
+        'last_name',
+        'mlc_id',
+        'mlc_type',
         'known_allergies',
         'chronic_conditions',
         'current_medications',
@@ -44,14 +52,31 @@ class Patient extends Model
         'photo_consent_given',
         'photo_consent_at',
         'photo_consent_signature_path',
+        'name_bindex',
+        'phone_bindex',
+        'email_bindex',
+        'abha_bindex',
     ];
 
     protected $casts = [
         'dob' => 'date',
+        'name' => 'encrypted',
+        'first_name' => 'encrypted',
+        'middle_name' => 'encrypted',
+        'last_name' => 'encrypted',
+        'phone' => 'encrypted',
+        'phone_alt' => 'encrypted',
+        'email' => 'encrypted',
+        'aadhaar' => 'encrypted',
+        'address' => 'encrypted',
+        'city' => 'string',
+        'state' => 'string',
+        'abha_id' => 'encrypted',
+        'abha_address' => 'encrypted',
+        'family_history' => 'encrypted',
         'known_allergies' => 'array',
         'chronic_conditions' => 'array',
         'current_medications' => 'array',
-        'family_history' => 'array',
         'abha_verified' => 'boolean',
         'abdm_consent_active' => 'boolean',
         'photo_consent_given' => 'boolean',
@@ -65,19 +90,111 @@ class Patient extends Model
     protected static function booted(): void
     {
         static::creating(function (Patient $patient) {
-            Log::info('Creating new patient', [
-                'clinic_id' => $patient->clinic_id,
-                'name' => $patient->name,
-                'phone' => $patient->phone
-            ]);
+            // Auto-generate UHID if not provided
+            if (!$patient->uhid) {
+                $patient->uhid = self::generateUhid($patient->clinic_id);
+            }
         });
 
-        static::created(function (Patient $patient) {
-            Log::info('Patient created successfully', ['id' => $patient->id, 'name' => $patient->name]);
-        });
+        static::saving(function (Patient $patient) {
+            // Reconstruct full name if any component changes to keep legacy field in sync
+            if ($patient->isDirty(['salutation', 'first_name', 'middle_name', 'last_name'])) {
+                $patient->name = trim(($patient->salutation ?? '') . ' ' . 
+                                      $patient->first_name . ' ' . 
+                                      ($patient->middle_name ?? '') . ' ' . 
+                                      ($patient->last_name ?? ''));
+            }
 
-        static::updating(function (Patient $patient) {
-            Log::info('Updating patient', ['id' => $patient->id, 'changes' => $patient->getDirty()]);
+            $salt = config('app.key');
+            
+            // Normalize and hash PII for search (Blind Indexing)
+            if ($patient->isDirty('name')) {
+                $patient->name_bindex = self::generateBlindIndex($patient->name, $salt, 'name');
+            }
+
+            if ($patient->isDirty('phone')) {
+                $patient->phone_bindex = self::generateBlindIndex($patient->phone, $salt, 'phone');
+            }
+
+            if ($patient->isDirty('email')) {
+                $patient->email_bindex = self::generateBlindIndex($patient->email, $salt, 'email');
+            }
+
+            if ($patient->isDirty('abha_id')) {
+                $patient->abha_bindex = self::generateBlindIndex($patient->abha_id, $salt, 'abha');
+            }
+        });
+    }
+
+    /**
+     * Generate a unique UHID for the patient based on clinic ID and sequence.
+     * Format: UHID-{CLINIC_ID}-{YY}-{SEQUENCE} (e.g., UHID-1-26-00001)
+     */
+    public static function generateUhid(int $clinicId): string
+    {
+        $yearCode = now()->format('y'); // 26 for 2026
+        $prefix = "UHID-{$clinicId}-{$yearCode}";
+        
+        // Find the last patient with this prefix
+        $lastPatient = self::where('clinic_id', $clinicId)
+            ->where('uhid', 'like', "{$prefix}-%")
+            ->orderBy('id', 'desc')
+            ->first();
+
+        $sequence = 1;
+        if ($lastPatient && preg_match('/-(\d+)$/', $lastPatient->uhid, $matches)) {
+            $sequence = (int)$matches[1] + 1;
+        }
+
+        return sprintf('%s-%05d', $prefix, $sequence);
+    }
+
+    /**
+     * Standardized normalization and hashing for blind indexing.
+     */
+    public static function generateBlindIndex(?string $value, string $salt, string $type): ?string
+    {
+        if (empty($value)) {
+            return null;
+        }
+
+        $normalized = match ($type) {
+            'phone' => preg_replace('/[^0-9]/', '', (string)$value),
+            'email', 'name' => strtolower(trim((string)$value)),
+            'abha' => strtoupper(trim((string)$value)),
+            default => trim((string)$value)
+        };
+
+        // If it's a phone number, we also strip the country code if it's 12 digits (assuming India +91)
+        if ($type === 'phone' && strlen($normalized) === 12 && str_starts_with($normalized, '91')) {
+            $normalized = substr($normalized, 2);
+        }
+
+        return hash_hmac('sha256', $normalized, $salt);
+    }
+
+    /**
+     * Scope to search by name, phone, email or ABHA ID using blind indexes,
+     * and by UHID using plain-text matching.
+     */
+    public function scopeSearchByToken($query, ?string $term = null)
+    {
+        if (empty($term)) {
+            return $query;
+        }
+
+        $salt = config('app.key');
+        
+        return $query->where(function ($q) use ($term, $salt) {
+            $q->where('name_bindex', self::generateBlindIndex($term, $salt, 'name'))
+              ->orWhere('email_bindex', self::generateBlindIndex($term, $salt, 'email'))
+              ->orWhere('abha_bindex', self::generateBlindIndex($term, $salt, 'abha'))
+              ->orWhere('uhid', 'like', "%{$term}%"); // Plain-text UHID search
+            
+            $phoneToken = self::generateBlindIndex($term, $salt, 'phone');
+            if ($phoneToken) {
+                $q->orWhere('phone_bindex', $phoneToken);
+            }
         });
     }
 
@@ -199,6 +316,32 @@ class Patient extends Model
             return $this->dob->age;
         }
         return $this->age_years;
+    }
+
+    /**
+     * Override getAttribute to gracefully handle plain-text data during encryption transition.
+     * This prevents DecryptException from crashing the app when existing plain text is read.
+     */
+    public function getAttribute($key)
+    {
+        try {
+            return parent::getAttribute($key);
+        } catch (\Illuminate\Contracts\Encryption\DecryptException $e) {
+            // Decryption fallback for access via $model->attribute
+            Log::debug('Patient decryption fallback used (getAttribute)', ['id' => $this->id, 'field' => $key]);
+            return $this->attributes[$key] ?? null;
+        }
+    }
+
+    protected function castAttribute($key, $value)
+    {
+        try {
+            return parent::castAttribute($key, $value);
+        } catch (\Illuminate\Contracts\Encryption\DecryptException $e) {
+            // Decryption fallback for toArray() / json_encode()
+            Log::debug('Patient decryption fallback used (castAttribute)', ['id' => $this->id, 'field' => $key]);
+            return $value;
+        }
     }
 
     public function hasAbha(): bool
