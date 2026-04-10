@@ -5,9 +5,13 @@ namespace App\Http\Controllers\Web;
 use App\Http\Controllers\Controller;
 use App\Models\LabTestCatalog;
 use App\Models\Patient;
+use App\Models\LabOrder;
 use App\Services\EnsureLabCatalogDefaults;
 use App\Services\LabSampleCollectionService;
+use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\Request;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\View\View;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -15,7 +19,7 @@ use Illuminate\Support\Facades\Schema;
 
 class LabController extends Controller
 {
-    public function dashboard()
+    public function dashboard(Request $request)
     {
         $clinicId = auth()->user()->clinic_id;
         Log::info('LabController@dashboard', ['clinic_id' => $clinicId]);
@@ -24,6 +28,7 @@ class LabController extends Controller
             'total_tests' => 0, 'active_tests' => 0,
             'pending_results' => 0, 'orders_today' => 0, 'results_received' => 0,
         ];
+
         $recentOrders = collect();
         $patients = collect();
 
@@ -41,23 +46,54 @@ class LabController extends Controller
                 $stats['orders_today'] = DB::table('lab_orders')->where('clinic_id', $clinicId)->whereDate('created_at', today())->count();
                 $stats['results_received'] = DB::table('lab_orders')->where('clinic_id', $clinicId)->where('status', 'completed')->whereMonth('created_at', now()->month)->count();
 
-                $recentOrders = DB::table('lab_orders')
-                    ->join('patients', 'lab_orders.patient_id', '=', 'patients.id')
-                    ->where('lab_orders.clinic_id', $clinicId)
-                    ->select('lab_orders.*', 'patients.name as patient_name')
-                    ->orderByDesc('lab_orders.created_at')
-                    ->limit(10)
-                    ->get();
+                $search = $request->query('search');
+                
+                // Fetch a pool of recent orders to allow for server-side filtering
+                // of encrypted names while keeping performance high.
+                $query = \App\Models\LabOrder::with(['patient', 'doctor', 'department'])
+                    ->where('clinic_id', $clinicId)
+                    ->orderByDesc('created_at');
+
+                if ($search) {
+                    // Fetch more records to filter in-memory because standard LIKE 
+                    // doesn't work on encrypted patient names.
+                    $allRecent = $query->limit(100)->get();
+                    
+                    $recentOrders = $allRecent->filter(function($order) use ($search) {
+                        $term = strtolower($search);
+                        
+                        // 1. Check Order Number
+                        if (str_contains(strtolower($order->order_number), $term)) return true;
+                        
+                        // 2. Check Accession Number
+                        if ($order->accession_number && str_contains(strtolower($order->accession_number), $term)) return true;
+                        
+                        // 3. Check Patient Name (DECRYPTED)
+                        if (str_contains(strtolower($order->patient_name ?? ''), $term)) return true;
+                        
+                        // 4. Check Patient UHID
+                        if (str_contains(strtolower($order->patient?->uhid ?? ''), $term)) return true;
+
+                        return false;
+                    })->take(20);
+                } else {
+                    $recentOrders = $query->limit(20)->get();
+                }
             }
 
             $patients = Patient::where('clinic_id', $clinicId)->orderBy('name')->get(['id', 'name', 'phone']);
 
-            Log::info('LabController@dashboard loaded', ['patients_count' => $patients->count(), 'stats' => $stats]);
+            Log::info('LabController@dashboard loaded', ['patients_count' => $patients->count(), 'stats' => $stats, 'search' => $search]);
         } catch (\Throwable $e) {
             Log::error('LabController@dashboard error', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
         }
 
-        return view('lab.index', compact('stats', 'recentOrders', 'patients'));
+        return view('lab.index', [
+            'stats' => $stats,
+            'recentOrders' => $recentOrders,
+            'patients' => $patients,
+            'search' => $request->query('search')
+        ]);
     }
 
     public function catalog(Request $request)
@@ -281,6 +317,7 @@ class LabController extends Controller
                     $select = [
                         'lab_orders.*',
                         'patients.name as patient_name',
+                        'lab_departments.name as department_name',
                     ];
                     if (Schema::hasColumn('patients', 'phone')) {
                         $select[] = 'patients.phone as patient_phone';
@@ -288,50 +325,33 @@ class LabController extends Controller
                         $select[] = DB::raw('NULL as patient_phone');
                     }
 
-                    $ordersQuery = DB::table('lab_orders')
-                        ->join('patients', 'lab_orders.patient_id', '=', 'patients.id')
-                        ->where('lab_orders.clinic_id', $clinicId)
-                        ->select($select);
-
-                    // Avoid correlated subquery in SELECT — it breaks some DBs / Laravel pagination count queries.
-                    // Line-item count can be added via eager subquery later if needed.
-                    $ordersQuery->addSelect(DB::raw('0 as tests_count'));
-
-                    $this->joinLabOrderDoctorForOrders($ordersQuery);
+                    $ordersQuery = LabOrder::with(['patient', 'department', 'doctor'])
+                        ->where('clinic_id', $clinicId);
 
                     if ($request->filled('patient_id')) {
-                        $ordersQuery->where('lab_orders.patient_id', $request->integer('patient_id'));
-                        Log::info('LabController@orders filtered by patient_id', ['patient_id' => $request->integer('patient_id')]);
+                        $ordersQuery->where('patient_id', $request->integer('patient_id'));
                     }
                     if ($request->filled('status')) {
-                        $ordersQuery->where('lab_orders.status', $request->string('status'));
+                        $ordersQuery->where('status', $request->string('status'));
                     }
-                    if ($request->filled('date_from') && Schema::hasColumn('lab_orders', 'created_at')) {
-                        $ordersQuery->whereDate('lab_orders.created_at', '>=', $request->date('date_from'));
+                    if ($request->filled('date_from')) {
+                        $ordersQuery->whereDate('created_at', '>=', $request->date('date_from'));
                     }
-                    if ($request->filled('date_to') && Schema::hasColumn('lab_orders', 'created_at')) {
-                        $ordersQuery->whereDate('lab_orders.created_at', '<=', $request->date('date_to'));
+                    if ($request->filled('date_to')) {
+                        $ordersQuery->whereDate('created_at', '<=', $request->date('date_to'));
                     }
                     if ($request->filled('search')) {
-                        $term = '%'.$request->string('search').'%';
+                        $term = $request->string('search');
                         $ordersQuery->where(function ($q) use ($term) {
-                            $q->where('patients.name', 'like', $term);
-                            if (Schema::hasColumn('lab_orders', 'order_number')) {
-                                $q->orWhere('lab_orders.order_number', 'like', $term);
-                            }
-                            if (Schema::hasColumn('lab_orders', 'accession_number')) {
-                                $q->orWhere('lab_orders.accession_number', 'like', $term);
-                            }
+                            $q->whereHas('patient', function ($pq) use ($term) {
+                                $pq->searchByToken($term);
+                            })
+                            ->orWhere('order_number', 'like', "%{$term}%")
+                            ->orWhere('accession_number', 'like', "%{$term}%");
                         });
                     }
 
-                    if (Schema::hasColumn('lab_orders', 'created_at')) {
-                        $orders = $ordersQuery->orderByDesc('lab_orders.created_at')->paginate(20)->withQueryString();
-                    } elseif (Schema::hasColumn('lab_orders', 'order_date')) {
-                        $orders = $ordersQuery->orderByDesc('lab_orders.order_date')->paginate(20)->withQueryString();
-                    } else {
-                        $orders = $ordersQuery->orderByDesc('lab_orders.id')->paginate(20)->withQueryString();
-                    }
+                    $orders = $ordersQuery->orderByDesc('created_at')->paginate(20)->withQueryString();
                 } catch (\Throwable $eList) {
                     Log::error('LabController@orders: order list query failed', [
                         'error' => $eList->getMessage(),
@@ -406,7 +426,16 @@ class LabController extends Controller
             $labOrderTestIds = [];
         }
 
-        return view('lab.orders', compact('orders', 'patients', 'tests', 'stats', 'labOrderTestIds'));
+        $departments = collect();
+        if (Schema::hasTable('lab_departments')) {
+            $departments = DB::table('lab_departments')
+                ->where('clinic_id', $clinicId)
+                ->where('is_active', true)
+                ->orderBy('name')
+                ->get();
+        }
+
+        return view('lab.orders', compact('orders', 'patients', 'tests', 'stats', 'labOrderTestIds', 'departments'));
     }
 
     public function collectSampleWeb(Request $request, int $orderId)
@@ -416,18 +445,109 @@ class LabController extends Controller
 
         $validated = $request->validate([
             'sample_type' => 'required|string|max:100',
+            'accession_number' => 'nullable|string|max:50',
             'collection_notes' => 'nullable|string',
         ]);
 
         try {
             app(LabSampleCollectionService::class)->collectForOrder($orderId, $clinicId, $validated);
+            
+            if ($request->wantsJson()) {
+                return response()->json(['success' => true, 'message' => 'Sample collected successfully.']);
+            }
         } catch (\Throwable $e) {
             Log::error('LabController@collectSampleWeb error', ['error' => $e->getMessage(), 'order_id' => $orderId]);
 
+            if ($request->wantsJson()) {
+                return response()->json(['success' => false, 'error' => $e->getMessage()], 422);
+            }
             return redirect()->route('laboratory.orders')->with('error', 'Could not record sample collection.');
         }
 
         return redirect()->route('laboratory.orders')->with('success', 'Sample collected. Accession recorded.');
+    }
+
+    public function orderDetailsApi(int $orderId)
+    {
+        $clinicId = auth()->user()->clinic_id;
+        try {
+            // Eager load everything that might contain data
+            $order = \App\Models\LabOrder::with(['patient', 'doctor', 'labOrderItems', 'labOrderTests'])
+                ->where('clinic_id', $clinicId)
+                ->findOrFail($orderId);
+            
+            // Collect items from multiple possible sources
+            $items = collect();
+            
+            // Source 1: labOrderItems (Modern HIMS)
+            if ($order->labOrderItems && $order->labOrderItems->isNotEmpty()) {
+                $items = $order->labOrderItems->map(fn($it) => [
+                    'id' => $it->id,
+                    'name' => $it->test_name ?? 'Unnamed Test',
+                    'test_code' => $it->test_code ?? '-',
+                    'price' => $it->price ?? 0,
+                    'status' => $it->status ?? 'pending'
+                ]);
+            } 
+            // Source 2: labOrderTests (Legacy/Integration relation)
+            elseif ($order->labOrderTests && $order->labOrderTests->isNotEmpty()) {
+                $items = $order->labOrderTests->map(fn($it) => [
+                    'id' => $it->id,
+                    'name' => $it->test_name ?? 'Unnamed Test',
+                    'test_code' => $it->test_code ?? '-',
+                    'price' => $it->price ?? 0,
+                    'status' => $it->status ?? 'pending'
+                ]);
+            }
+            // Source 3: JSON 'tests' column (External Integrations)
+            else {
+                $rawTests = $order->getAttribute('tests');
+                if (is_string($rawTests)) {
+                    $rawTests = json_decode($rawTests, true);
+                }
+                if (is_array($rawTests)) {
+                    $items = collect($rawTests)->map(fn($t, $idx) => [
+                        'id' => 'json-' . $idx,
+                        'name' => is_array($t) ? ($t['name'] ?? $t['test_name'] ?? 'Test') : (is_string($t) ? $t : 'Test'),
+                        'test_code' => is_array($t) ? ($t['code'] ?? $t['test_code'] ?? '-') : '-',
+                        'price' => is_array($t) ? ($t['price'] ?? 0) : 0,
+                        'status' => is_array($t) ? ($t['status'] ?? 'sent') : 'sent',
+                    ]);
+                }
+            }
+
+            // Safe metadata discovery
+            $patientName = $order->patient_name ?: ($order->patient ? $order->patient->name : 'Walk-in Patient');
+            $patientPhone = $order->patient_phone ?: ($order->patient ? $order->patient->phone : '—');
+            
+            return response()->json([
+                'success' => true,
+                'order' => [
+                    'id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'status' => $order->status,
+                    'created_at' => $order->created_at ? $order->created_at->format('d M Y, h:i A') : null,
+                    'total_amount' => $order->total_amount,
+                    'patient' => [
+                        'name' => $patientName,
+                        'phone' => $patientPhone,
+                    ],
+                    'doctor' => $order->doctor ? ['name' => $order->doctor->name] : ['name' => 'Self / Walk-in'],
+                    'department_name' => $order->department_name ?? $order->department?->name ?? 'Laboratory',
+                    'items' => $items
+                ]
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('LabController@orderDetailsApi error', [
+                'id' => $orderId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return response()->json([
+                'success' => false, 
+                'error' => 'Technical error: ' . $e->getMessage()
+            ], 500);
+        }
     }
 
     public function viewOrderReport(int $orderId)
@@ -481,6 +601,73 @@ class LabController extends Controller
         }
     }
 
+    public function approveReport(Request $request, int $orderId)
+    {
+        $clinicId = auth()->user()->clinic_id;
+
+        try {
+            $order = DB::table('lab_orders')
+                ->where('id', $orderId)
+                ->where('clinic_id', $clinicId)
+                ->first();
+
+            if (!$order) {
+                return back()->with('error', 'Lab order not found.');
+            }
+
+            // Mark as sent
+            $orderCols = array_flip(\Illuminate\Support\Facades\Schema::getColumnListing('lab_orders'));
+            $update = ['updated_at' => now()];
+
+            if (isset($orderCols['status'])) {
+                $update['status'] = 'sent';
+            }
+            if (isset($orderCols['result_sent_at'])) {
+                $update['result_sent_at'] = now();
+            }
+            if (isset($orderCols['result_sent_to_patient'])) {
+                $update['result_sent_to_patient'] = true;
+            }
+
+            DB::table('lab_orders')->where('id', $orderId)->update($update);
+
+            \App\Models\AuditLog::log(
+                'lab_results_approved',
+                "Doctor approved lab results for order #{$orderId}",
+                'lab_orders',
+                $orderId
+            );
+
+            // Notify over WhatsApp
+            $patient = \App\Models\Patient::find($order->patient_id);
+            $labOrder = \App\Models\LabOrder::find($orderId);
+
+            Log::info('Checking notification requirements', [
+                'order_id' => $orderId,
+                'patient_found' => (bool)$patient,
+                'lab_order_found' => (bool)$labOrder,
+                'patient_phone' => $patient?->phone,
+            ]);
+
+            if ($patient && $labOrder && $patient->phone) {
+                Log::info('Triggering WhatsAppService@sendLabResults', ['order_id' => $orderId]);
+                app(\App\Services\WhatsAppService::class)->sendLabResults($patient, $labOrder);
+                Log::info('WhatsApp lab results sent after doctor approval', ['order_id' => $orderId]);
+            } else {
+                Log::warning('WhatsApp lab results skipped', [
+                    'order_id' => $orderId,
+                    'patient_id' => $order->patient_id,
+                    'reason' => (!$patient ? 'Patient not found' : (!$labOrder ? 'LabOrder not found' : 'Phone missing'))
+                ]);
+            }
+
+            return back()->with('success', 'Lab report approved and patient notified via WhatsApp.');
+        } catch (\Throwable $e) {
+            Log::error('LabController@approveReport error', ['error' => $e->getMessage()]);
+            return back()->with('error', 'Error approving report: ' . $e->getMessage());
+        }
+    }
+
     /**
      * Left join ordering doctor for lab orders list / report (doctor_name for report template).
      */
@@ -516,6 +703,9 @@ class LabController extends Controller
             'tests.*' => 'exists:lab_tests_catalog,id',
             'notes' => 'nullable|string',
             'priority' => 'in:routine,urgent,stat',
+            'sample_collection_type' => 'nullable|in:lab,home',
+            'collection_date' => 'nullable|date',
+            'collection_address' => 'nullable|string',
         ]);
         $clinicId = auth()->user()->clinic_id;
 
@@ -578,36 +768,57 @@ class LabController extends Controller
         Log::info('LabController@resultEntry', ['order_id' => $orderId, 'clinic_id' => $clinicId]);
 
         try {
-            $order = DB::table('lab_orders')
-                ->join('patients', 'lab_orders.patient_id', '=', 'patients.id')
-                ->where('lab_orders.id', $orderId)
-                ->where('lab_orders.clinic_id', $clinicId)
-                ->select('lab_orders.*', 'patients.name as patient_name')
+            $order = \App\Models\LabOrder::with('patient')
+                ->where('id', $orderId)
+                ->where('clinic_id', $clinicId)
                 ->firstOrFail();
             $items = $this->buildResultEntryLineItems($orderId);
             Log::info('LabController@resultEntry items', ['order_id' => $orderId, 'count' => $items->count()]);
 
             return view('lab.result-entry', compact('order', 'items'));
         } catch (\Throwable $e) {
-            Log::error('LabController@resultEntry error', ['error' => $e->getMessage(), 'order_id' => $orderId]);
             return redirect()->route('laboratory.orders')->with('error', 'Failed to load result entry: ' . $e->getMessage());
+        }
+    }
+
+    public function downloadReport(Request $request, $orderId)
+    {
+        $clinicId = auth()->user()->clinic_id;
+        try {
+            $order = \App\Models\LabOrder::with(['patient', 'doctor', 'clinic'])
+                ->where('id', $orderId)
+                ->where('clinic_id', $clinicId)
+                ->firstOrFail();
+            
+            $items = $this->buildResultEntryLineItems($orderId);
+            $clinic = auth()->user()->clinic;
+
+            $pdf = Pdf::loadView('lab.report-pdf', compact('order', 'items', 'clinic'));
+            
+            return $pdf->stream("Lab_Report_{$order->order_number}.pdf");
+        } catch (\Throwable $e) {
+            Log::error('LabController@downloadReport error', ['error' => $e->getMessage(), 'order_id' => $orderId]);
+            return redirect()->back()->with('error', 'Failed to generate PDF: ' . $e->getMessage());
         }
     }
 
     public function saveResult(Request $request, $orderId)
     {
-        Log::info('LabController@saveResult', ['order_id' => $orderId]);
+        $action = $request->input('action', 'save_print'); // 'draft' or 'save_print'
+        $notes = $request->input('notes');
+        
+        Log::info('LabController@saveResult', ['order_id' => $orderId, 'action' => $action]);
 
         $validated = $request->validate([
             'results' => 'required|array',
             'results.*.item_id' => 'required|integer',
             'results.*.value' => 'required|string',
-            'results.*.is_abnormal' => 'nullable|boolean',
+            'results.*.is_abnormal' => 'nullable|integer', // Changed to integer to match form 0/1
             'results.*.remarks' => 'nullable|string',
         ]);
 
         try {
-            DB::transaction(function () use ($validated, $orderId) {
+            DB::transaction(function () use ($validated, $orderId, $action, $notes) {
                 $itemCols = Schema::hasTable('lab_order_items')
                     ? array_flip(Schema::getColumnListing('lab_order_items'))
                     : [];
@@ -627,15 +838,13 @@ class LabController extends Controller
                     if (isset($itemCols['remarks'])) {
                         $update['remarks'] = $result['remarks'] ?? null;
                     }
-                    if (isset($itemCols['status'])) {
+                    if (isset($itemCols['status']) && $action === 'save_print') {
                         $update['status'] = 'completed';
                     }
                     if (isset($itemCols['updated_at'])) {
                         $update['updated_at'] = now();
                     }
                     if ($update === []) {
-                        Log::warning('LabController@saveResult: no updatable columns on lab_order_items');
-
                         continue;
                     }
                     $q = DB::table('lab_order_items')->where('id', $result['item_id']);
@@ -649,21 +858,27 @@ class LabController extends Controller
                 $orderCols = Schema::hasTable('lab_orders')
                     ? array_flip(Schema::getColumnListing('lab_orders'))
                     : [];
-                if (isset($orderCols['status'])) {
-                    $orderUpdate['status'] = 'completed';
+                
+                if (isset($orderCols['notes'])) {
+                    $orderUpdate['notes'] = $notes;
                 }
-                if (isset($orderCols['completed_at'])) {
+
+                if (isset($orderCols['status'])) {
+                    $orderUpdate['status'] = ($action === 'save_print') ? 'completed' : 'processing';
+                }
+                
+                if (isset($orderCols['completed_at']) && $action === 'save_print') {
                     $orderUpdate['completed_at'] = now();
                 }
+
                 DB::table('lab_orders')->where('id', $orderId)->update($orderUpdate);
-                Log::info('LabController@saveResult order updated', ['order_id' => $orderId, 'keys' => array_keys($orderUpdate)]);
             });
 
-            Log::info('Lab results saved', ['order_id' => $orderId]);
-            return redirect()->route('laboratory.orders')->with('success', 'Results saved successfully');
+            $msg = $action === 'save_print' ? 'Results verified and completed successfully' : 'Draft results saved successfully';
+            return redirect()->route('laboratory.index')->with('success', $msg);
         } catch (\Throwable $e) {
             Log::error('LabController@saveResult error', ['error' => $e->getMessage(), 'order_id' => $orderId]);
-            return redirect()->route('laboratory.orders')->with('error', 'Failed to save results: ' . $e->getMessage());
+            return redirect()->back()->withInput()->with('error', 'Failed to save results: ' . $e->getMessage());
         }
     }
 
@@ -693,6 +908,9 @@ class LabController extends Controller
             'order_number' => 'LAB-' . strtoupper(uniqid()),
             'order_date' => now()->toDateString(),
             'status' => 'pending',
+            'sample_collection_type' => $validated['sample_collection_type'] ?? 'lab',
+            'collection_date' => $validated['collection_date'] ?? null,
+            'collection_address' => $validated['collection_address'] ?? null,
             'created_at' => now(),
             'updated_at' => now(),
         ];
@@ -793,10 +1011,83 @@ class LabController extends Controller
             $select[] = DB::raw('NULL as reference_range');
         }
 
+        if (isset($catCols['category'])) {
+            $select[] = 'lab_tests_catalog.category';
+        } else {
+            $select[] = DB::raw("'General' as category");
+        }
+
         return DB::table('lab_order_items')
             ->join('lab_tests_catalog', "lab_order_items.{$testFk}", '=', 'lab_tests_catalog.id')
             ->where("lab_order_items.{$orderFk}", $orderId)
             ->select($select)
             ->get();
+    }
+
+    public function editTest(int $id): View
+    {
+        $clinicId = auth()->user()->clinic_id;
+        $test = DB::table('lab_tests_catalog')->where('clinic_id', $clinicId)->where('id', $id)->first();
+        if (!$test) abort(404);
+
+        $categories = DB::table('lab_tests_catalog')
+            ->where('clinic_id', $clinicId)
+            ->distinct()
+            ->orderBy('category')
+            ->pluck('category')
+            ->filter();
+
+        return view('lab.edit-test', compact('test', 'categories'));
+    }
+
+    public function updateTest(Request $request, int $id): RedirectResponse
+    {
+        $clinicId = auth()->user()->clinic_id;
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'code' => 'nullable|string|max:50',
+            'category' => 'required|string|max:100',
+            'price' => 'required|numeric|min:0',
+            'turnaround_hours' => 'nullable|integer|min:1',
+            'sample_type' => 'nullable|string|max:100',
+            'reference_range' => 'nullable|string',
+            'unit' => 'nullable|string|max:50',
+            'is_active' => 'boolean',
+        ]);
+
+        $update = [
+            'test_name' => $validated['name'],
+            'test_code' => $validated['code'],
+            'price' => $validated['price'],
+            'tat_hours' => $validated['turnaround_hours'],
+            'sample_type' => $validated['sample_type'],
+            'unit' => $validated['unit'],
+            'is_active' => $request->has('is_active'),
+            'updated_at' => now(),
+        ];
+
+        // Handle both simple and HIMS schemas
+        $cols = array_flip(Schema::getColumnListing('lab_tests_catalog'));
+        if (isset($cols['name'])) $update['name'] = $validated['name'];
+        if (isset($cols['code'])) $update['code'] = $validated['code'];
+        if (isset($cols['category'])) $update['category'] = $validated['category'];
+
+        DB::table('lab_tests_catalog')
+            ->where('clinic_id', $clinicId)
+            ->where('id', $id)
+            ->update(array_intersect_key($update, $cols));
+
+        return redirect()->route('laboratory.catalog')->with('success', 'Test updated successfully');
+    }
+
+    public function destroyTest(int $id): RedirectResponse
+    {
+        $clinicId = auth()->user()->clinic_id;
+        DB::table('lab_tests_catalog')
+            ->where('clinic_id', $clinicId)
+            ->where('id', $id)
+            ->delete();
+
+        return redirect()->route('laboratory.catalog')->with('success', 'Test removed from catalog.');
     }
 }

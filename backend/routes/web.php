@@ -14,6 +14,7 @@ use App\Http\Controllers\Web\PaymentWebController;
 use App\Http\Controllers\Web\GstReportWebController;
 use App\Http\Controllers\Web\PhotoVaultWebController;
 use App\Http\Controllers\Web\PrescriptionWebController;
+use App\Http\Controllers\Web\InsuranceClaimController;
 use App\Http\Controllers\Web\ClinicUserController;
 use App\Http\Controllers\Web\PublicBookingController;
 use App\Http\Controllers\Web\AiDocumentationController;
@@ -31,6 +32,7 @@ use App\Http\Controllers\Web\AppShellController;
 use App\Http\Controllers\Web\SubscriptionController;
 use App\Http\Controllers\Web\IpdController;
 use App\Http\Controllers\Web\PharmacyController;
+use App\Http\Controllers\Web\WardManagementController;
 use App\Http\Controllers\Web\LabController;
 use App\Http\Controllers\Web\LabTechnicianController;
 use App\Http\Controllers\Web\OpdController;
@@ -93,13 +95,14 @@ Route::get('/subscription/expired', fn() => view('subscription.expired'))->name(
 
 // Authenticated routes
 Route::middleware(['auth', 'trial'])->group(function () {
+    Route::get('/universal-search', [\App\Http\Controllers\Web\SearchController::class, 'universalSearch'])->name('universal-search');
     Route::post('/logout', [AuthController::class, 'logout'])->name('logout');
 
     // ═══════════════════════════════════════════════════════════════════════
     // Clinic overview — owner & doctor only (not lab / pharmacy / nurse / receptionist)
     // ═══════════════════════════════════════════════════════════════════════
     Route::middleware(['role:owner,doctor'])->group(function () {
-        Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+        Route::get('/dashboard', [\App\Http\Controllers\Web\DashboardController::class, 'index'])->name('dashboard');
         Route::get('/schedule', [AppointmentWebController::class, 'index'])->name('schedule');
     });
 
@@ -150,6 +153,7 @@ Route::middleware(['auth', 'trial'])->group(function () {
             Route::post('/{patient}/create', [EmrWebController::class, 'create'])->name('create');
             Route::patch('/{patient}/{visit}', [EmrWebController::class, 'update'])->name('update');
             Route::post('/{patient}/{visit}/finalise', [EmrWebController::class, 'finalise'])->name('finalise');
+            Route::post('/{patient}/{visit}/unfinalize', [EmrWebController::class, 'unfinalize'])->name('unfinalize');
             
             // EMR sub-features
             Route::post('/{patient}/{visit}/lesions', [EmrWebController::class, 'addLesion'])->name('add-lesion');
@@ -297,6 +301,7 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::post('/clinic', [SettingsWebController::class, 'updateClinic'])->name('clinic')->middleware('role:owner');
         Route::post('/billing', [SettingsWebController::class, 'updateBilling'])->name('billing')->middleware('role:owner');
         Route::post('/ai-credentials', [SettingsWebController::class, 'updateAiCredentials'])->name('ai-credentials')->middleware('role:owner');
+        Route::post('/integrations', [SettingsWebController::class, 'updateIntegrations'])->name('integrations')->middleware('role:owner');
     });
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -341,10 +346,10 @@ Route::middleware(['auth', 'trial'])->group(function () {
             
             // Prescription actions
             Route::post('/visit/{visit}/save', [PrescriptionWebController::class, 'savePrescription'])->name('save');
-            Route::get('/visit/{visit}/pdf', [PrescriptionWebController::class, 'generatePdf'])->name('pdf');
-            Route::get('/visit/{visit}/spectacle-pdf', [PrescriptionWebController::class, 'spectaclePdf'])->name('spectacle-pdf');
-            Route::get('/visit/{visit}/contact-lens-pdf', [PrescriptionWebController::class, 'contactLensPdf'])->name('contact-lens-pdf');
-            Route::post('/visit/{visit}/whatsapp', [PrescriptionWebController::class, 'sendWhatsApp'])->name('whatsapp');
+            Route::get('/{prescription}/pdf', [PrescriptionWebController::class, 'generatePdf'])->name('pdf');
+            Route::get('/{prescription}/spectacle-pdf', [PrescriptionWebController::class, 'spectaclePdf'])->name('spectacle-pdf');
+            Route::get('/{prescription}/contact-lens-pdf', [PrescriptionWebController::class, 'contactLensPdf'])->name('contact-lens-pdf');
+            Route::post('/{prescription}/whatsapp', [PrescriptionWebController::class, 'sendWhatsApp'])->name('whatsapp');
             
             // Templates
             Route::get('/templates', [PrescriptionWebController::class, 'getTemplates'])->name('templates');
@@ -364,6 +369,9 @@ Route::middleware(['auth', 'trial'])->group(function () {
             Route::post('/map-fields', [AiAssistantController::class, 'mapToEmrFields'])->name('map-fields');
             Route::post('/generate-notes', [AiDocumentationController::class, 'generateNotes'])->name('generate-notes');
             Route::post('/extract-codes', [AiDocumentationController::class, 'extractCodes'])->name('extract-codes');
+            Route::post('/suggest-diagnosis', [AiDocumentationController::class, 'suggestDiagnosis'])->name('suggest-diagnosis');
+            Route::post('/safety-check', [AiDocumentationController::class, 'analyzeClinicalSafety'])->name('safety-check');
+            Route::post('/extract-document', [AiDocumentationController::class, 'extractFromDocument'])->name('extract-document');
             Route::post('/visit/{visit}/save', [AiDocumentationController::class, 'saveToVisit'])->name('save-to-visit');
             Route::post('/generate-letter', [AiDocumentationController::class, 'generateLetter'])->name('generate-letter');
         });
@@ -388,16 +396,18 @@ Route::middleware(['auth', 'trial'])->group(function () {
     // ═══════════════════════════════════════════════════════════════════════
     Route::middleware(['role:doctor,receptionist'])->group(function () {
         Route::prefix('insurance')->name('insurance.')->group(function () {
-            Route::get('/', [InsuranceController::class, 'index'])->name('index');
-            Route::get('/tpas', [InsuranceController::class, 'getTPAs'])->name('tpas');
-            Route::get('/patient/{patient}/preauth', [InsuranceController::class, 'createPreAuth'])->name('preauth.create');
-            Route::post('/preauth', [InsuranceController::class, 'submitPreAuth'])->name('preauth.submit');
-            Route::post('/claims', [InsuranceController::class, 'submitClaim'])->name('claims.submit');
-            Route::post('/claims/{claim}/status', [InsuranceController::class, 'updateClaimStatus'])->name('claims.status');
-            Route::post('/patient/{patient}/insurance', [InsuranceController::class, 'savePatientInsurance'])->name('patient.save');
-            Route::get('/claims/{claim}/form', [InsuranceController::class, 'generateClaimForm'])->name('claims.form');
-            Route::post('/tpa-config', [InsuranceController::class, 'storeTpaConfig'])->name('tpa.store');
-            Route::delete('/tpa-config/{config}', [InsuranceController::class, 'destroyTpaConfig'])->name('tpa.destroy');
+            Route::get('/', [InsuranceClaimController::class, 'index'])->name('index');
+            Route::get('/tpas', [InsuranceClaimController::class, 'getTPAs'])->name('tpas');
+            Route::get('/patient/{patient}/preauth', [InsuranceClaimController::class, 'createPreAuth'])->name('preauth.create');
+            Route::post('/preauth', [InsuranceClaimController::class, 'submitPreAuth'])->name('preauth.submit');
+            Route::post('/claims', [InsuranceClaimController::class, 'store'])->name('claims.submit');
+            Route::post('/claims/{claim}/status', [InsuranceClaimController::class, 'updateStatus'])->name('claims.status');
+            Route::post('/patient/{patient}/insurance', [InsuranceClaimController::class, 'savePatientInsurance'])->name('patient.save');
+            Route::get('/claims/{claim}/print', [InsuranceClaimController::class, 'generateClaimForm'])->name('claims.print');
+            Route::post('/tpa-config', [InsuranceClaimController::class, 'storeTpaConfig'])->name('tpa.store');
+            Route::get('/invoices/search', [InsuranceClaimController::class, 'searchInvoices'])->name('invoices.search');
+            Route::get('/diag', [App\Http\Controllers\Web\DiagnosticController::class, 'checkTable']);
+            Route::delete('/tpa-config/{config}', [InsuranceClaimController::class, 'destroyTpaConfig'])->name('tpa.destroy');
         });
     });
 
@@ -412,6 +422,13 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::put('/{user}', [ClinicUserController::class, 'update'])->name('update');
         Route::post('/{user}/toggle-status', [ClinicUserController::class, 'toggleStatus'])->name('toggle-status');
         Route::delete('/{user}', [ClinicUserController::class, 'destroy'])->name('destroy');
+    });
+
+    // Role & Permission Matrix (RBAC) - owner ONLY
+    Route::prefix('settings/roles')->name('settings.roles.')->middleware('role:owner')->group(function () {
+        Route::get('/', [\App\Http\Controllers\Settings\RoleMatrixController::class, 'index'])->name('matrix');
+        Route::post('/update', [\App\Http\Controllers\Settings\RoleMatrixController::class, 'update'])->name('updateMatrix');
+        Route::post('/role', [\App\Http\Controllers\Settings\RoleMatrixController::class, 'storeRole'])->name('store');
     });
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -445,6 +462,9 @@ Route::middleware(['auth', 'trial'])->group(function () {
         // Literal /admit must not be captured by /{admission} (otherwise "admit" resolves as ID and breaks the page).
         Route::get('/admit', [IpdController::class, 'create'])->name('create');
         Route::post('/admit', [IpdController::class, 'store'])->name('store');
+        Route::get('/{admission}/edit', [IpdController::class, 'edit'])->name('edit')->whereNumber('admission');
+        Route::put('/{admission}', [IpdController::class, 'update'])->name('update')->whereNumber('admission');
+        Route::delete('/{admission}', [IpdController::class, 'destroy'])->name('destroy')->whereNumber('admission');
         Route::post('/{admission}/discharge', [IpdController::class, 'discharge'])->name('discharge')->whereNumber('admission');
         Route::post('/{admission}/vitals', [IpdController::class, 'recordVitals'])->name('vitals.store')->whereNumber('admission');
         Route::post('/{admission}/progress-notes', [IpdController::class, 'addProgressNote'])->name('progress-notes.store')->whereNumber('admission');
@@ -457,6 +477,7 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::get('/{admission}/vitals', [IpdController::class, 'redirectVitalsTab'])->name('vitals.page')->whereNumber('admission');
         Route::get('/{admission}/print-card', [IpdController::class, 'printCard'])->name('print-card')->whereNumber('admission');
         Route::get('/{admission}/print-prescription', [IpdController::class, 'printPrescription'])->name('print-prescription')->whereNumber('admission');
+        Route::get('/{admission}/discharge-summary', [IpdController::class, 'dischargeSummary'])->name('discharge-summary')->whereNumber('admission');
         Route::get('/{admission}', [IpdController::class, 'show'])->name('show')->whereNumber('admission');
     });
 
@@ -470,9 +491,13 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::get('/medicine-catalog/search', [PharmacyController::class, 'searchMedicineCatalog'])->name('medicine-catalog.search');
         Route::get('/items/create', [PharmacyController::class, 'addItem'])->name('items.create');
         Route::post('/items', [PharmacyController::class, 'addItem'])->name('items.store');
+        Route::get('/items/{id}/edit', [PharmacyController::class, 'editItem'])->name('items.edit');
+        Route::put('/items/{id}', [PharmacyController::class, 'updateItem'])->name('items.update');
+        Route::delete('/items/{id}', [PharmacyController::class, 'destroyItem'])->name('items.destroy');
         Route::post('/stock-in', [PharmacyController::class, 'stockIn'])->name('stock.in');
         Route::get('/dispense', [PharmacyController::class, 'dispensingForm'])->name('dispense.form');
         Route::post('/dispense', [PharmacyController::class, 'dispense'])->name('dispense');
+        Route::get('/dispense/{dispensing}/print', [PharmacyController::class, 'printReceipt'])->name('dispense.print');
         Route::get('/history', [PharmacyController::class, 'dispensingHistory'])->name('history');
         Route::get('/reports', [PharmacyController::class, 'stockReport'])->name('reports');
         Route::get('/purchases', [PharmacyController::class, 'purchasesIndex'])->name('purchases.index');
@@ -480,6 +505,9 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::post('/purchases', [PharmacyController::class, 'purchaseStore'])->name('purchases.store');
         Route::get('/suppliers', [PharmacyController::class, 'suppliersIndex'])->name('suppliers.index');
         Route::post('/suppliers', [PharmacyController::class, 'storeSupplier'])->name('suppliers.store');
+        Route::get('/suppliers/{supplier}/edit', [PharmacyController::class, 'editSupplier'])->name('suppliers.edit');
+        Route::put('/suppliers/{supplier}', [PharmacyController::class, 'updateSupplier'])->name('suppliers.update');
+        Route::delete('/suppliers/{supplier}', [PharmacyController::class, 'destroySupplier'])->name('suppliers.destroy');
         Route::get('/expiry-alerts', [PharmacyController::class, 'expiryAlerts'])->name('expiry-alerts');
         Route::get('/returns', [PharmacyController::class, 'returnsForm'])->name('returns.form');
         Route::post('/returns', [PharmacyController::class, 'storeReturn'])->name('returns.store');
@@ -488,14 +516,21 @@ Route::middleware(['auth', 'trial'])->group(function () {
     // ═══════════════════════════════════════════════════════════════════════
     // LAB MANAGEMENT (Internal LIS)
     // ═══════════════════════════════════════════════════════════════════════
-    Route::prefix('laboratory')->name('laboratory.')->middleware(['role:doctor,lab_technician', 'hims:lis_collection'])->group(function () {
+    Route::prefix('laboratory')->name('laboratory.')->middleware(['role:owner,doctor,lab_technician', 'hims:lis_collection'])->group(function () {
         Route::get('/', [LabController::class, 'dashboard'])->name('index');
         Route::get('/catalog', [LabController::class, 'catalog'])->name('catalog');
         Route::post('/catalog', [LabController::class, 'storeTest'])->name('catalog.store');
+        Route::get('/catalog/{id}/edit', [LabController::class, 'editTest'])->name('catalog.edit');
+        Route::put('/catalog/{id}', [LabController::class, 'updateTest'])->name('catalog.update');
+        Route::get('/catalog/{id}', [LabController::class, 'showTest'])->name('catalog.show');
+        Route::delete('/catalog/{id}', [LabController::class, 'destroyTest'])->name('catalog.destroy');
         Route::get('/orders', [LabController::class, 'orders'])->name('orders');
         Route::post('/orders', [LabController::class, 'storeOrder'])->name('orders.store');
+        Route::get('/orders/{orderId}/details-json', [LabController::class, 'orderDetailsApi'])->name('orders.details-json');
         Route::post('/orders/{orderId}/collect-sample', [LabController::class, 'collectSampleWeb'])->name('orders.collect-sample');
         Route::get('/orders/{orderId}/report', [LabController::class, 'viewOrderReport'])->name('orders.report');
+        Route::get('/orders/{orderId}/download', [LabController::class, 'downloadReport'])->name('orders.download');
+        Route::post('/orders/{orderId}/approve', [LabController::class, 'approveReport'])->name('orders.approve');
         Route::get('/orders/{orderId}/results', [LabController::class, 'resultEntry'])->name('result-entry');
         Route::post('/orders/{orderId}/results', [LabController::class, 'saveResult'])->name('save-result');
     });
@@ -503,7 +538,7 @@ Route::middleware(['auth', 'trial'])->group(function () {
     // ═══════════════════════════════════════════════════════════════════════
     // LAB TECHNICIAN PORTAL
     // ═══════════════════════════════════════════════════════════════════════
-    Route::prefix('lab-portal')->name('lab.technician.')->middleware(['role:lab_technician', 'hims:lis_collection'])->group(function () {
+    Route::prefix('lab-portal')->name('lab.technician.')->middleware(['role:owner,lab_technician', 'hims:lis_collection'])->group(function () {
         Route::get('/', [LabTechnicianController::class, 'dashboard'])->name('dashboard');
         // Static paths before {orderId} so IDs like "doctor-results" never shadow named routes
         Route::get('/doctor-results', [LabTechnicianController::class, 'doctorResults'])->name('doctor-results');
@@ -576,6 +611,28 @@ Route::middleware(['auth', 'trial'])->group(function () {
         Route::post('/import', [CustomEmrBuilderController::class, 'importTemplate'])->name('import');
         Route::get('/field-types', [CustomEmrBuilderController::class, 'getFieldTypes'])->name('field-types');
     });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // WARD MANAGEMENT SYSTEM (Floors, Wards, Rooms, Beds)
+    // ═══════════════════════════════════════════════════════════════════════
+    Route::prefix('ward-management')->name('ward-management.')->middleware(['role:owner,doctor', 'hims:ipd_hospital'])->group(function () {
+        Route::get('/', [WardManagementController::class, 'index'])->name('index');
+        
+        // Floors
+        Route::get('/floors', [WardManagementController::class, 'floors'])->name('floors');
+        Route::post('/floors', [WardManagementController::class, 'storeFloor'])->name('floors.store');
+        
+        // Wards
+        Route::get('/wards', [WardManagementController::class, 'wards'])->name('wards');
+        Route::post('/wards', [WardManagementController::class, 'storeWard'])->name('wards.store');
+        
+        // Rooms
+        Route::get('/rooms', [WardManagementController::class, 'rooms'])->name('rooms');
+        Route::post('/rooms', [WardManagementController::class, 'storeRoom'])->name('rooms.store');
+        
+        // Beds
+        Route::post('/beds', [WardManagementController::class, 'storeBed'])->name('beds.store');
+    });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -639,4 +696,12 @@ Route::post('/webhooks/razorpay', [PaymentWebController::class, 'handleWebhook']
 // ═══════════════════════════════════════════════════════════════════════════
 // RAZORPAY SUBSCRIPTION WEBHOOK (No auth required)
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC PDF ROUTES (Signed URLs for WhatsApp)
+// ═══════════════════════════════════════════════════════════════════════════
+Route::get('/prescription/{prescription}/pdf-public', [PrescriptionWebController::class, 'generatePdf'])
+    ->middleware('signed')
+    ->name('prescription.pdf.public');
+
 Route::post('/subscription/webhook', [SubscriptionController::class, 'webhook'])->name('subscription.webhook');
